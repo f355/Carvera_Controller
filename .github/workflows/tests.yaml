@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - develop
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: unit + integration
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests in container
+        env:
+          # GitHub-hosted runners have docker preinstalled; force the
+          # wrapper to use it rather than probing for podman.
+          CONTAINER_CMD: docker
+        run: tests/integration/run-in-container.sh tests/unit tests/integration -v
+
+      - name: Upload visual diff output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-diff-output
+          path: tests/integration/output/
+          if-no-files-found: ignore
+          retention-days: 14
