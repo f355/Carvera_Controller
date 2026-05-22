@@ -1,0 +1,97 @@
+# Linux/Xvfb image for the visual regression suite.
+#
+# This image produces the committed reference screenshots and is the
+# environment the suite compares them against. Native runs (including
+# bare-metal Linux) pick up host fonts / Mesa / FreeType / Kivy
+# providers and won't match the committed PNGs.
+# Invoked via tests/integration/run-in-container.sh.
+#
+# Build is split into stable system layers first, then the deps layer,
+# so iterating on pyproject.toml / poetry.lock only re-runs the last
+# RUN step.
+
+FROM python:3.13-slim-bookworm
+
+# Don't write .pyc files inside the bind-mount, and don't buffer stdout
+# so pytest output streams in real time.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    POETRY_VERSION=2.4.1 \
+    POETRY_VIRTUALENVS_CREATE=false \
+    POETRY_NO_INTERACTION=1
+
+# System packages:
+#   xvfb           — virtual framebuffer X server (Window.screenshot needs GL)
+#   git, git-lfs   — LFS-aware checkout / commit for reference PNGs
+#   libgl1, libegl1, libgles2, libsdl2-*  — Kivy's SDL2 backend
+#   libmtdev1      — Kivy multitouch device support
+#   fonts-dejavu, fonts-noto-color-emoji  — font drift is the #1 cause
+#     of Linux-vs-macOS pixel diffs; we pin to DejaVu and let Kivy's
+#     fontconfig pick those.
+#   ca-certificates, pipx  — to install Poetry without polluting site-packages.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb \
+        xauth \
+        git \
+        git-lfs \
+        ca-certificates \
+        build-essential \
+        libgl1 \
+        libegl1 \
+        libgles2 \
+        libsdl2-2.0-0 \
+        libsdl2-image-2.0-0 \
+        libsdl2-mixer-2.0-0 \
+        libsdl2-ttf-2.0-0 \
+        libmtdev1 \
+        libffi-dev \
+        fonts-dejavu \
+        fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-create the X11 socket directory. Rootless docker runs the
+# entrypoint as a non-root user that can't create directories under /tmp,
+# so Xvfb fails with "euid != 0, directory /tmp/.X11-unix will not be
+# created" unless the directory already exists with the standard 1777 mode.
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+# Install Poetry into the same Python the project uses (python:3.13).
+# Using `pipx` here would pull in Debian's python3.11 transitively and
+# pip's PEP 517 isolated builds would then try to link C extensions
+# (pyquicklz) against /usr/include/python3.11 which doesn't ship in
+# this image. One Python only.
+RUN python -m pip install "poetry==${POETRY_VERSION}"
+
+# Pre-populate the dep cache. We copy ONLY the lock + project metadata
+# so this layer only invalidates when those change. The workspace is
+# bind-mounted over /workspace at runtime; the venv pre-installed here
+# lives in poetry's cache and is re-used by the runtime `poetry install`
+# (which becomes a no-op when the lock matches).
+WORKDIR /build
+COPY pyproject.toml poetry.lock README.md ./
+RUN mkdir -p carveracontroller scripts \
+    && touch carveracontroller/__init__.py scripts/__init__.py \
+    && poetry install --only main,test --no-root \
+    && rm -rf /build
+
+WORKDIR /workspace
+
+# Container entrypoint: start Xvfb explicitly rather than via xvfb-run.
+# xvfb-run relies on Xvfb signalling SIGUSR1 to its grandparent shell
+# when the display is ready, and that signal is not reliably delivered
+# under rootless podman — the script blocks forever in `wait`. Starting
+# Xvfb ourselves and polling for the X11 socket avoids the issue while
+# still propagating pytest's exit code (via `exec`).
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -e' \
+    'Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &' \
+    'for i in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done' \
+    '[ -e /tmp/.X11-unix/X99 ] || { echo "Xvfb failed to start" >&2; exit 1; }' \
+    'export DISPLAY=:99' \
+    'exec poetry run pytest "$@"' \
+    > /usr/local/bin/run-tests && chmod +x /usr/local/bin/run-tests
+ENTRYPOINT ["/usr/local/bin/run-tests"]
+CMD ["tests/integration", "-v"]

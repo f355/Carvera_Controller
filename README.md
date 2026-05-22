@@ -128,6 +128,23 @@ To have the checks run automatically on every `git commit`, install the pre-comm
 poetry run pre-commit install
 ```
 
+### Testing
+
+Unit tests live under `tests/unit/` and run with no extra setup:
+
+```bash
+poetry run pytest tests/unit
+```
+
+Visual integration tests boot the real Kivy app, capture screenshots, and compare them against committed reference PNGs. The container wrapper produces the reference PNGs and is the path that matches them; pixel output without the container will differ. Run the suite in a Linux/Xvfb podman/docker environment from any host:
+
+```bash
+tests/integration/run-in-container.sh tests/integration -v                                 # run the suite
+tests/integration/run-in-container.sh tests/integration -v --update-committed-references   # regen baselines after intentional UI changes
+```
+
+See [`tests/integration/README.md`](tests/integration/README.md) for details. The suite also runs in CI on every PR via [`.github/workflows/tests.yaml`](.github/workflows/tests.yaml).
+
 ### Local Packaging
 
 The application is packaged using PyInstaller (except for iOS). This tool converts Python applications into a standalone executable, so it can be run on systems without requiring management of a installed Python interpreter or dependent libraries. An build helper script is configured with Poetry and can be run with:
