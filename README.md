@@ -135,6 +135,45 @@ To format checked Python files, run:
 poetry run ruff format carveracontroller tests scripts
 ```
 
+### Visual Regression Tests
+
+The screenshot tests support two reference modes:
+
+* Local mode uses ignored host-local references in `tests/integration/local-reference/`.
+* Committed mode uses tracked Linux references in `tests/integration/reference/`.
+
+For fast local UI iteration, create host-local references before changing the UI:
+
+```bash
+poetry run python scripts/visual_tests.py local-update
+```
+
+Then compare against those local references:
+
+```bash
+poetry run python scripts/visual_tests.py local-compare
+```
+
+Local comparisons skip any screenshot that is missing from `tests/integration/local-reference/`; they do not fall back
+to committed Linux references. Extra pytest arguments can be passed after the script command, for example:
+
+```bash
+poetry run python scripts/visual_tests.py local-compare \
+  tests/integration/test_visual_regression.py::TestDisconnectedState::test_control_page
+```
+
+Use the container workflow when updating or checking the committed Linux baselines:
+
+```bash
+poetry run python scripts/visual_tests.py container-update
+poetry run python scripts/visual_tests.py container-compare
+```
+
+The container script uses Podman if available, then Docker. Override that with `VISUAL_TEST_ENGINE=docker` or
+`--engine docker`. The image tag can be overridden with `VISUAL_TEST_IMAGE` or `--image`. The script passes a native
+container platform by default, such as `linux/arm64` on Apple Silicon and `linux/amd64` on typical CI runners;
+override it with `VISUAL_TEST_PLATFORM` or `--platform` if your container engine uses a remote architecture.
+
 ### Local Packaging
 
 The application is packaged using PyInstaller (except for iOS). This tool converts Python applications into a standalone executable, so it can be run on systems without requiring management of a installed Python interpreter or dependent libraries. An build helper script is configured with Poetry and can be run with:

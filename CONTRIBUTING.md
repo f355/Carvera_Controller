@@ -40,4 +40,8 @@ Run the test suite separately:
 poetry run python -m pytest tests -q
 ```
 
-For targeted checks, run the individual Poetry commands listed in the [Quality Checks section in the README](README.md#quality-checks).
+For screenshot visual tests, use local ignored references while iterating and the container workflow when updating or
+checking committed Linux references. See [README visual tests](README.md#visual-regression-tests) for commands.
+
+For targeted checks, run the individual Poetry commands listed in the
+[Quality Checks section in the README](README.md#quality-checks).

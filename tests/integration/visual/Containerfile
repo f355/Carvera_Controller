@@ -1,0 +1,35 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    POETRY_HOME=/opt/poetry \
+    POETRY_VIRTUALENVS_PATH=/opt/poetry-venvs \
+    PATH="/opt/poetry/bin:${PATH}" \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    fonts-dejavu-core \
+    libgl1 \
+    libgles2 \
+    libmtdev1 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+RUN curl -sSL https://install.python-poetry.org | python3.12 -
+
+WORKDIR /workspace
+
+COPY pyproject.toml poetry.lock ./
+RUN poetry install --only main,test --no-root
+
+CMD ["sh", "-lc", "xvfb_log=/tmp/carvera-xvfb.log; rm -f \"$xvfb_log\"; Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >\"$xvfb_log\" 2>&1 & xvfb_pid=$!; trap \"kill $xvfb_pid\" EXIT; for i in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done; [ -e /tmp/.X11-unix/X99 ] || { cat \"$xvfb_log\"; exit 1; }; DISPLAY=:99 poetry run python3 scripts/visual_tests.py _container-compare"]

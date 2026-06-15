@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import threading
 import time
+from contextlib import suppress
 
 # Isolate Kivy config to a temp directory so tests don't mutate the user's
 # real Kivy config. Must be set BEFORE any Kivy import.
@@ -19,6 +20,7 @@ os.environ.setdefault("KIVY_LOG_MODE", "MIXED")
 os.environ.setdefault("KIVY_NO_CONSOLELOG", "0")
 
 import pytest
+from kivy.animation import Animation
 from kivy.config import Config
 from PIL import Image, ImageChops
 
@@ -30,11 +32,35 @@ Config.set("kivy", "exit_on_escape", "0")
 Config.set("kivy", "pause_on_minimize", "0")
 Config.set("input", "mouse", "mouse,multitouch_on_demand")
 
+import kivy.uix.widget as kivy_widget
 from kivy.base import EventLoop
 from kivy.clock import Clock
+from kivy.lang import Builder
 
-REFERENCE_DIR = os.path.join(os.path.dirname(__file__), "reference")
+from tests.integration.visual_references import create_visual_reference_config
+
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+
+
+def _start_animation_at_end(self, widget):
+    for prop_name, value in self.animated_properties.items():
+        with suppress(Exception):
+            setattr(widget, prop_name, value)
+    with suppress(Exception):
+        self.dispatch("on_complete", widget)
+
+
+Animation.start = _start_animation_at_end
+
+
+def _safe_widget_destructor(uid, _ref):
+    if uid not in kivy_widget._widget_destructors:
+        return
+    del kivy_widget._widget_destructors[uid]
+    Builder.unbind_widget(uid)
+
+
+kivy_widget._widget_destructor = _safe_widget_destructor
 
 
 def pump_frames(count=10, sleep=0):
@@ -52,6 +78,17 @@ def pump_frames(count=10, sleep=0):
         Clock.tick()
 
 
+def force_render_to_backbuffer():
+    """Render the current Kivy frame before reading Window.screenshot()."""
+    from kivy.core.window import Window
+
+    Window.canvas.ask_update()
+    Builder.sync()
+    Clock.tick_draw()
+    Builder.sync()
+    Window.dispatch("on_draw")
+
+
 def apply_machine_state(app):
     """Push current CNC.vars into the UI widgets and let the UI settle.
 
@@ -60,7 +97,43 @@ def apply_machine_state(app):
     """
     app.root.config_loaded = True
     app.root.updateStatus()
-    pump_frames(20, sleep=0.05)  # 20 frames * 50ms = ~1 second
+    freeze_animated_status(app)
+    pump_frames(5)
+    freeze_animated_status(app)
+
+
+def show_content_page(app, page_name):
+    """Switch the main content page and wait for the visual tree to settle."""
+    app.root.content.transition.direction = "right" if page_name == "File" else "left"
+    app.root.content.current = page_name
+    pump_frames(5)
+
+
+def stabilize_gcode_viewer(app):
+    """Render loaded gcode from the app's default full-toolpath view."""
+    viewer = app.root.gcode_viewer
+    viewer.set_display_offset(app.root.content.x, app.root.content.y)
+    app.root.gcode_play_to_end()
+    viewer.restore_default_view()
+    viewer._on_frame_tick(0)
+    viewer.canvas.ask_update()
+    pump_frames(5)
+
+
+def freeze_animated_status(app):
+    """Pin cyclic/blinking status widgets to deterministic display states."""
+    Clock.unschedule(app.root.blink_state)
+    Clock.unschedule(app.root.switch_status)
+    app.root.status_index = 0
+    app.root.holding = 0
+    app.root.pausing = 0
+    app.root.waiting = 0
+    app.root.tooling = 0
+    app.root.updateStatus()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    shutil.rmtree(_kivy_home, ignore_errors=True)
 
 
 def load_gcode_file(app, filepath):
@@ -98,6 +171,7 @@ def capture_screenshot(app, name):
     """
     from kivy.core.window import Window
 
+    force_render_to_backbuffer()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     filepath = os.path.join(OUTPUT_DIR, f"{name}.png")
 
@@ -113,16 +187,14 @@ def capture_screenshot(app, name):
     return filepath
 
 
-def compare_screenshots(name):
+def compare_screenshots(name, visual_reference_config):
     """Compare an output screenshot against its reference baseline.
 
     Saves a diff image on failure for debugging.
     """
-    ref_path = os.path.join(REFERENCE_DIR, f"{name}.png")
+    visual_reference_config.skip_if_missing(name)
+    ref_path = visual_reference_config.reference_path(name)
     out_path = os.path.join(OUTPUT_DIR, f"{name}.png")
-
-    if not os.path.exists(ref_path):
-        pytest.skip(f"No reference screenshot for '{name}'. Run with --update-references to create one.")
 
     ref = Image.open(ref_path).convert("RGB")
     out = Image.open(out_path).convert("RGB")
@@ -138,11 +210,11 @@ def compare_screenshots(name):
         pytest.fail(f"Visual difference detected in '{name}'. Diff region: {bbox}. See {diff_path}")
 
 
-def save_reference(name):
+def save_reference(name, visual_reference_config):
     """Copy an output screenshot to become the new reference baseline."""
-    os.makedirs(REFERENCE_DIR, exist_ok=True)
+    visual_reference_config.reference_dir.mkdir(parents=True, exist_ok=True)
     src = os.path.join(OUTPUT_DIR, f"{name}.png")
-    dst = os.path.join(REFERENCE_DIR, f"{name}.png")
+    dst = visual_reference_config.reference_path(name)
     shutil.copy2(src, dst)
 
 
@@ -151,8 +223,54 @@ def pytest_addoption(parser):
         "--update-references",
         action="store_true",
         default=False,
-        help="Update reference screenshots instead of comparing against them.",
+        help="Update reference screenshots in the selected visual reference mode.",
     )
+    parser.addoption(
+        "--visual-reference-mode",
+        choices=("local", "committed"),
+        default="local",
+        help=(
+            "Reference screenshot source: local uses the ignored host-local directory, "
+            "committed uses tracked Linux container baselines."
+        ),
+    )
+    parser.addoption(
+        "--visual-run",
+        action="store_true",
+        default=False,
+        help="Run visual regression tests. The visual runner sets this while isolating each test process.",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "visual_reference(name): screenshot reference name used for early missing-reference checks.",
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    marker = item.get_closest_marker("visual_reference")
+    if marker is None or not item.config.getoption("--visual-run"):
+        return
+
+    reference_config = create_visual_reference_config(
+        item.config.getoption("--visual-reference-mode"),
+        item.config.getoption("--update-references"),
+    )
+    reference_config.skip_if_missing(marker.args[0])
+
+
+def pytest_collection_modifyitems(items):
+    visual_path = os.path.join("tests", "integration", "test_visual_regression.py")
+    run_visual = items[0].config.getoption("--visual-run") if items else False
+    skip_visual = pytest.mark.skip(reason="run visual regression tests with scripts/visual_tests.py")
+    for item in items:
+        normalized_path = os.path.normpath(str(item.path))
+        if run_visual or not normalized_path.endswith(visual_path):
+            continue
+        item.add_marker(skip_visual)
 
 
 @pytest.fixture(scope="session")
@@ -161,13 +279,41 @@ def update_references(request):
 
 
 @pytest.fixture(scope="session")
+def visual_reference_config(request):
+    return create_visual_reference_config(
+        request.config.getoption("--visual-reference-mode"),
+        request.config.getoption("--update-references"),
+    )
+
+
+@pytest.fixture(autouse=True)
+def disable_modal_animations(monkeypatch):
+    """Make popup screenshots deterministic by disabling ModalView fades."""
+    from kivy.uix.modalview import ModalView
+
+    original_open = ModalView.open
+    original_dismiss = ModalView.dismiss
+
+    def open_without_animation(self, *_args, **kwargs):
+        kwargs["animation"] = False
+        return original_open(self, *_args, **kwargs)
+
+    def dismiss_without_animation(self, *_args, **kwargs):
+        kwargs["animation"] = False
+        return original_dismiss(self, *_args, **kwargs)
+
+    monkeypatch.setattr(ModalView, "open", open_without_animation)
+    monkeypatch.setattr(ModalView, "dismiss", dismiss_without_animation)
+
+
+@pytest.fixture(scope="session")
 def kivy_app():
     """Boot the full MakeraApp with mocked hardware.
 
-    This mirrors the startup sequence in main.py:main() but avoids calling
-    app.run(), which would block forever in the Kivy event loop. Instead we
-    use _run_prepare() to build the widget tree and manually pump frames.
+    The visual runner invokes pytest once per screenshot test, so this
+    session-scoped fixture creates one app instance per isolated process.
     """
+
     import carveracontroller.main as main_module
     from carveracontroller import translation
     from carveracontroller.main import (
@@ -199,27 +345,20 @@ def kivy_app():
     register_fonts(base_path)
     register_images(base_path)
 
-    # Create the app and build its widget tree without entering the event loop
     EventLoop.ensure_window()
     app = MakeraApp()
     app._run_prepare()
 
-    # Disable screen transition animations so page switches are instant
     from kivy.uix.screenmanager import NoTransition
 
     app.root.content.transition = NoTransition()
     app.root.cmd_manager.transition = NoTransition()
 
-    # Let the UI settle with real elapsed time so timed callbacks complete
-    # (blink_state @ 0.5s, viewport updates @ 0.25s, etc.)
-    pump_frames(60, sleep=0.05)  # 60 frames * 50ms = ~3 seconds
+    pump_frames(10)
+    freeze_animated_status(app)
 
     yield app
 
-    # Teardown: stop background threads and close the event loop
-    app.root.stop.set()  # signals monitorSerial to exit
+    app.root.stop.set()
     app.stop()
     EventLoop.close()
-
-    # Clean up temp Kivy home
-    shutil.rmtree(_kivy_home, ignore_errors=True)
